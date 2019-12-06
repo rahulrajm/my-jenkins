@@ -1,0 +1,485 @@
+import net.sf.json.JSONArray
+import net.sf.json.JSONObject
+import hudson.model.*
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+// This is to validate the code base before proceeding with build steps.
+// In the interest of performance, avoid xml and json parsing and instead rely on text extraction even though it may not be rigorously accurate
+def validate(branch, gitHeadTag, gitLatestTag, buildPropsExists,
+             packageJsonExists, buildPropsVersion, packageJsonVersion) {
+    def errorMessage = ""
+    def isInvalid = false;
+
+    // Directory.Build.props OR package.json MUST exist
+    if(!buildPropsExists && !packageJsonExists) {
+        isInvalid = true;
+        errorMessage = errorMessage + "Found neither Directory.Build.props nor package.json. Aborting.";
+    }
+
+    // For hybrid repositories, Directory.Build.props and package.json versions must match
+    if(!isInvalid && buildPropsExists && packageJsonExists && buildPropsVersion != packageJsonVersion) {
+        isInvalid = true;
+        errorMessage = errorMessage + "Mismatch between Directory.Build.props version (" + buildPropsVersion + ") and package.json version (" + packageJsonVersion + "). Aborting.";
+    }
+
+    // Directory.Build.props, if present, MUST contain a value for VersionPrefix
+    if(!isInvalid && buildPropsExists && buildPropsVersion == "") {
+        isInvalid = true;
+        errorMessage = errorMessage + "Directory.Build.props does not contain VersionPrefix. Aborting.";
+    }
+
+    // Directory.Build.props, if present, MUST NOT contain a value for VersionSuffix
+    if(!isInvalid && buildPropsExists &&
+            "0" != sh(script: "grep '<.*VersionSuffix.*>[0-9].*</.*VersionSuffix>' Directory.Build.props | wc -l", returnStdout: true).toString().replace("\n","")
+    ) {
+        isInvalid = true;
+        errorMessage = errorMessage + "Directory.Build.props MUST NOT contain a value for VersionSuffix. Aborting.";
+    }
+
+    // VersionPrefix and VersionSuffix must NOT be present in individual csproj files
+    if(!isInvalid && buildPropsExists && "0" != sh(script: "find . -type f -name *.csproj|xargs grep -l -e VersionPrefix -e VersionSuffix|wc -l", returnStdout: true).toString().replace("\n","")) {
+        isInvalid = true;
+        errorMessage = errorMessage + "csproj file must not contain VersionPrefix or VersionSuffix. Aborting."
+    }
+
+    // For master branch, if HEAD is tagged, and Directory.Build.props is present, HEAD tag MUST match VersionPrefix
+    if(!isInvalid && "master" == branch && gitHeadTag != "" && buildPropsExists && gitHeadTag != buildPropsVersion) {
+        isInvalid = true;
+        errorMessage = errorMessage + "Mismatch between git HEAD tag (" + gitHeadTag + ") and Directory.Build.props VersionPrefix (" + buildPropsVersion + "). Aborting."
+    }
+
+    // For master branch, if HEAD is tagged, and package.json is present, HEAD tag must match version
+    if(!isInvalid && "master" == branch && gitHeadTag != "" && packageJsonExists && gitHeadTag != packageJsonVersion) {
+        isInvalid = true;
+        errorMessage = errorMessage + "Mismatch between git HEAD tag (" + gitHeadTag + ") and package.json version (" + packageJsonVersion + "). Aborting."
+    }
+
+    if(!isInvalid && "master" == branch && buildPropsExists) {
+        if("0" != sh(script: "find . -type f -name *.csproj|xargs grep '<PackageReference.*Include.*LendFoundry.*Version.*-.*/>'|wc -l", returnStdout: true).toString().replace("\n","")
+                || "0" != sh(script: "find . -type f -name *.csproj|xargs grep '<PackageReference.*Include.*LMS.*Version.*-.*/>'|wc -l", returnStdout: true).toString().replace("\n","")
+                || "0" != sh(script: "find . -type f -name *.csproj|xargs grep '<PackageReference.*Include.*CreditExchange.*Version.*-.*/>'|wc -l", returnStdout: true).toString().replace("\n","")
+                || "0" != sh(script: "find . -type f -name *.csproj|xargs grep '<PackageReference.*Include.*Fc360.*Version.*-.*/>'|wc -l", returnStdout: true).toString().replace("\n","")
+                || "0" != sh(script: "find . -type f -name *.csproj|xargs grep '<PackageReference.*Include.*Docitt.*Version.*-.*/>'|wc -l", returnStdout: true).toString().replace("\n","")
+        ) {
+            isInvalid = true;
+            errorMessage = errorMessage + "The csproj files must not contain invalid /Project/PackageReference@Version values for master branch. Aborting."
+        }
+    }
+
+    if(isInvalid) {
+        echo errorMessage
+        currentBuild.result = 'ABORTED'
+        fNotify(errorMessage);
+        throw new Exception(errorMessage);
+    }
+}
+
+// It is expected that getVersion() would be called after validate()
+def getVersion(branch, gitHeadTag, gitLatestTag, buildPropsExists,
+               packageJsonExists, buildPropsVersion, packageJsonVersion) {
+    if("master" == branch && gitHeadTag != "") {
+        return gitHeadTag
+    }
+    if("master" == branch && gitHeadTag == "" && buildPropsExists) {
+        return buildPropsVersion
+    }
+    if("master" == branch && gitHeadTag == "" && packageJsonExists) {
+        return packageJsonVersion
+    }
+    if("master" != branch && buildPropsExists) {
+        return buildPropsVersion
+    }
+    if("master" != branch && packageJsonExists) {
+        return packageJsonVersion
+    }
+}
+
+def getVersionSuffix(branch, gitHeadTag, gitLatestTag, buildPropsExists,
+                     packageJsonExists, buildPropsVersion, packageJsonVersion) {
+    if("master" == branch && gitHeadTag != "") {
+        return ""
+    }
+    def commitTs = sh(script: "git show -s --format=%ct", returnStdout: true).toString().replace("\n","")
+    def commitMs = Long.valueOf(commitTs) * 1000
+    def commitTime = new Date(commitMs).format("yyyyMMdd-HHmmss", TimeZone.getTimeZone("Asia/Calcutta")) + "IST"
+    def shortCommitId = sh(script: "git rev-parse --short HEAD", returnStdout: true).toString().replace("\n","")
+
+    return "${branch}-${commitTime}-${shortCommitId}"
+}
+
+def getDockerImageTag(version, versionSuffix) {
+    if("" == versionSuffix) {
+        return version
+    }
+    return "${version}-${versionSuffix}"
+}
+
+def notify(color, message) {
+    message = message.toString()
+    def job = "Project: ${env.JOB_NAME} (${env.BUILD_DISPLAY_NAME})".toString()
+    def stage = "Stage: ${env.STAGE_NAME}".toString()
+
+    JSONArray attachments = new JSONArray();
+    JSONObject attachment = new JSONObject();
+
+    attachment.put('color', color);
+    attachment.put('pretext', job.toString());
+    if (env.STAGE_NAME != null) {
+        attachment.put('title', stage.toString());
+    }
+    attachment.put('title_link', env.RUN_DISPLAY_URL);
+    attachment.put('text', "${message} \n\n Logs at: ${env.RUN_DISPLAY_URL}".toString());
+    attachment.put('footer', "Lendfoundry");
+    attachment.put('footer_icon', "https://crunchbase-production-res.cloudinary.com/image/upload/c_lpad,h_256,w_256,f_auto,q_auto:eco/v1462135845/sgicxqzhnjk56hsfw1f5.jpg");
+    attachment.put('ts', System.currentTimeMillis() / 1000);
+
+    attachments.add(attachment);
+    //TODO: Uncomment to send Slack notification
+    //slackSend(attachments: attachments.toString())
+}
+
+def sNotify(message) {
+    notify('good',message)
+}
+
+def fNotify(message) {
+    notify('danger', message)
+}
+
+// Thanks to https://stackoverflow.com/a/39908900/41284
+// Use when you do not want actual command to be printed to the logs, replace with sh if you want it to (eg to debug)
+def shNoLog(cmd) {
+    sh('#!/bin/sh -e\n' + cmd)
+}
+
+
+def call(body) {
+    def config = [:]
+    body.resolveStrategy = Closure.DELEGATE_FIRST
+    body.delegate = config
+    body()
+
+    public static final int MASTER_BRANCH_BUILD = 1;
+    public static final int DEVELOP_BRANCH_BUILD = 2;
+    public static final int FEATURE_BRANCH_BUILD = 3;
+    public static final int HOTFIX_BRANCH_BUILD = 4;
+
+    // Default mode is 3 (meaning feature branch)
+    // Just build and publish docker, build nugets but not publish them
+    def report = "\n\n*Build (and deploy) Report:* \n\n";
+    def mode = FEATURE_BRANCH_BUILD;
+    def branch = env.BRANCH_NAME;
+    def branchType = "";
+    if (branch == "master") {
+        // We do usual stuff in `node` right after checkout scm
+    } else if (branch == "develop") {
+        report = "${report}mode: `Develop build`\n"
+        // Build and publish docker, nuget with develop-#build-num
+        mode = DEVELOP_BRANCH_BUILD;
+        branchType = "develop branch";
+    } else if (branch == "hotfix") {
+        report = "${report}mode: `Hotfix build`\n"
+        mode = HOTFIX_BRANCH_BUILD;
+        branchType = "hotfix branch";
+    } else if (branch.contains("feature/")) {
+        // If configs says to skip feature branches
+        if (config.skipFeatureBuilds) {
+            currentBuild.result = 'ABORTED'
+            error('Aborting: Skipping Feature Build')
+        }
+        report = "${report}mode: `Feature build (${branch})`\n"
+        branch = branch.replace("/", "-")
+        branchType = "feature branch"
+    } else if (branch.contains("PR-")) {
+        report = "${report}mode: `Pull Request build (${branch})`\n"
+        branch = branch.replace("/", "-")
+        branchType = "pull request"
+    } else {
+        currentBuild.result = 'ABORTED'
+        error('Aborting: Unknown / untracked branch configuration')
+    }
+
+    def containers = []
+    if (config.docker_targets == null) {
+        config.docker_targets = []
+    }
+
+    if (config.nuget_targets == null) {
+        config.nuget_targets = []
+    }
+
+    if (config.npm_targets == null) {
+        config.npm_targets = []
+    }
+
+    def shouldBuildDockerImage = config.docker_targets.size() > 0
+    def shouldBuildNugets = config.nuget_targets.size() > 0
+    def shouldBuildNpm = config.npm_targets.size() > 0
+
+    // Early exit
+    if (!(shouldBuildDockerImage || shouldBuildNugets || shouldBuildNpm)) {
+        echo "No build targets defined (nugets / docker any one must be provided)"
+        currentBuild.result = 'FAILED'
+        fNotify("Build stage failed: No build targets defined (nugets / docker any one must be provided)")
+        throw new Exception("No build targets defined (nugets / docker any one must be provided)")
+    }
+
+    node {
+        // added to solve the issue of jenkins building stale commits
+        step([$class: 'WsCleanup'])
+        //    checkout scm
+        checkout([
+                $class: 'GitSCM',
+                branches: scm.branches,
+                doGenerateSubmoduleConfigurations: scm.doGenerateSubmoduleConfigurations,
+                extensions: scm.extensions + [[$class: 'CloneOption', noTags: false, reference: '', shallow: true],[$class: 'CleanCheckout']],
+                submoduleCfg: [],
+                userRemoteConfigs: scm.userRemoteConfigs
+        ])
+
+
+        // populate variables from pulled code
+        def buildPropsExists = false;
+        def packageJsonExists = false;
+        def packageJsonMultipleExists = false;
+        def buildPropsVersion = "";
+        def packageJsonVersion = "";
+        if(fileExists('Directory.Build.props')) {
+            buildPropsExists = true;
+            // get version from Directory.Build.props
+            buildPropsVersion = sh(script: "grep '<.*VersionPrefix.*>[0-9].*</.*VersionPrefix>' Directory.Build.props | cut -f2 -d'>' | cut -f1 -d'<' ", returnStdout: true).toString().replace("\n","").trim();
+        }
+
+        def packageJsonCount = sh(script: "find . -name package.json|grep -v node_modules | wc -l", returnStdout: true).toString().replace("\n","").trim();
+        if("0" == packageJsonCount) {
+            packageJsonExists = false;
+            packageJsonMultipleExists = false;
+        } else if ("1" == packageJsonCount) {
+            packageJsonExists = true;
+            packageJsonMultipleExists = false;
+            // grep does not print the file name so field 2
+            // Trying with awk to extract correct version number.
+            packageJsonVersion = sh(script: "cat \$(find . -name package.json|grep -v node_modules) | grep version | head -1 | awk -F: '{ print \$2 }' | sed 's/[\",]//g'", returnStdout: true).toString().replace("\n","").trim();
+        } else {
+            packageJsonExists = true;
+            packageJsonMultipleExists = true;
+            // grep does not print the file name so field 3
+            packageJsonVersion = sh(script: "find . -name package.json|grep -v node_modules |xargs grep \"version\".*:|cut -f3 -d:|sed 's/\"//g'|sed 's/,//g'|sort -unr | head -1", returnStdout: true).toString().replace("\n","").trim();
+        }
+
+        // populate variables from git repository
+        def gitLatestTag = ""
+        def gitHeadTag = sh(script: "git tag --points-at HEAD --sort=-v:refname | grep ^v[0-9] | head -1 | cut -c2- ", returnStdout: true).toString().replace("\n","")
+
+        if(gitHeadTag == "") {
+            // HEAD is not tagged. Try to get the latest tag (even though head has moved ahead)
+            gitLatestTag = sh(script: "git tag -l --sort=-v:refname | grep ^v[0-9] | head -1 | cut -c2- ", returnStdout: true).toString().replace("\n","");
+        } else {
+            // HEAD tag is also the latest tag
+            gitLatestTag = gitHeadTag
+        }
+
+        validate(branch, gitHeadTag, gitLatestTag, buildPropsExists,
+                packageJsonExists, buildPropsVersion, packageJsonVersion);
+
+        if(buildPropsExists) {
+            // TODO replace user and pass with env variables
+            shNoLog(
+                    "echo '<?xml version=\"1.0\" encoding=\"utf-8\"?> <configuration> <packageSources> <add key=\"kuber\" value=\"http://nexus-kuber.lendfoundry.com/repository/nuget-hosted/\" /> <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" /> </packageSources> <packageSourceCredentials> <kuber> <add key=\"Username\" value=\"jenkins\" /> <add key=\"ClearTextPassword\" value=\"giZ57fUO2m9q\" /> </kuber> </packageSourceCredentials> </configuration>' > src/NuGet.Config"
+            )
+        }
+
+        def commitId = sh(script: "git rev-parse HEAD", returnStdout: true).toString().replace("\n","")
+
+        def version = getVersion(branch, gitHeadTag, gitLatestTag,
+                buildPropsExists, packageJsonExists,
+                buildPropsVersion, packageJsonVersion)
+        def versionSuffix = getVersionSuffix(branch, gitHeadTag, gitLatestTag,
+                buildPropsExists,
+                packageJsonExists,
+                buildPropsVersion,
+                packageJsonVersion)
+
+        def dockerImageTag = getDockerImageTag(version, versionSuffix)
+
+        if (branch == "master") {
+            if (gitHeadTag == null || gitHeadTag == "") {
+                report = "${report}mode: `Master build (un-tagged build)`\n"
+                mode = FEATURE_BRANCH_BUILD;
+                branchType = "master branch";
+            } else {
+                report = "${report}mode: `Master build (release build)`\n"
+                mode = MASTER_BRANCH_BUILD;
+                branchType = "master branch";
+            }
+        }
+
+        stage('Build') {
+
+            parallel 'docker': {
+                if (shouldBuildDockerImage) {
+                    docker.image('docker').inside {
+                        for(target in config.docker_targets) {
+                            def image = "${DOCKER_REPO}/${target.image}:${dockerImageTag}"
+                            def buildArguments = "";
+                            if(target.buildArguments != null && target.buildArguments.size() > 0) {
+                                target.buildArguments.each{
+                                    buildArguments = "${buildArguments} --build-arg ${it}"
+                                }
+                            }
+                            if(target.buildArguments == null) {
+                                // dotnet image creation
+                                try {
+                                    sh """
+                                    env | grep 'DOCKER_PASS' | cut -d '=' -f2 | docker login --username \${DOCKER_USER} --password-stdin \${DOCKER_REPO}
+                                    docker build \
+                                    -f ${target.dockerfile} \
+                                    -t ${image} \
+                                    --label lendfoundry.branch=${branch} \
+                                    --label lendfoundry.commit=${commitId} \
+                                    --label lendfoundry.tag=${dockerImageTag} \
+                                    --build-arg RESTORE="dotnet restore --ignore-failed-sources --no-cache --configfile /app/NuGet.Config" \
+                                    \$(dirname ${target.dockerfile})
+                                """
+
+                                    if (FEATURE_BRANCH_BUILD != mode) {
+                                        sh """
+                                        docker push ${image}
+                                    """
+                                    } else {
+                                        report = "${report}`Built but not published (as its a ${branchType})`\n"
+                                        echo "Built but not published"
+                                    }
+
+
+                                    report = "${report}Docker: `${image}`\n"
+                                } catch(Exception e) {
+                                    report = "${report} :zany_face: Failed at build `docker image`\n"
+                                    fNotify(report)
+                                    throw e
+                                }
+
+                            } else {
+                                // node.js image creation
+                                try {
+                                    sh """
+                                    env | grep 'DOCKER_PASS' | cut -d '=' -f2 | docker login --username \${DOCKER_USER} --password-stdin \${DOCKER_REPO}
+                                    docker build \
+                                    -f ${target.dockerfile} \
+                                    -t ${image} \
+                                    --label lendfoundry.branch=${branch} \
+                                    --label lendfoundry.commit=${commitId} \
+                                    --label lendfoundry.tag=${dockerImageTag} \
+                                    ${buildArguments} \
+                                    \$(dirname ${target.dockerfile})
+                                    docker push ${image}
+                                    """
+
+                                    report = "${report}Docker: `${image}`\n"
+                                } catch(Exception e) {
+                                    report = "${report} :zany_face: Failed at build `docker image`\n"
+                                    fNotify(report)
+                                    throw e
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            'nuget': {
+                if (shouldBuildNugets) {
+                    docker.image('microsoft/dotnet:2.1.302-sdk').inside {
+                        try {
+                            for(target in config.nuget_targets) {
+                                sh """
+                            dotnet clean -c Release -v q ${target}/\$(basename ${target}).csproj && \
+                            cwd=`pwd`
+                            cd ${target} && \
+                            dotnet restore --verbosity q --ignore-failed-sources --no-cache --configfile \${cwd}/src/NuGet.Config && \
+                            dotnet build -c Release -v q --no-restore \$(basename ${target}).csproj && \
+                            dotnet pack -c Release -v q --version-suffix "${versionSuffix}" --no-build -o . \$(basename ${target}).csproj && \
+                            cd \$cwd
+                            """
+                                if (FEATURE_BRANCH_BUILD != mode) {
+                                    // Name of the nuget package
+                                    def nuget = sh(script: "ls ${target}/\$(basename ${target})*.nupkg", returnStdout: true).toString();
+                                    def nugetname = sh(script: "basename \$(ls ${target}/\$(basename ${target})*.nupkg)", returnStdout: true).toString().replace("\n","");
+                                    report = "${report}Nuget: `${nugetname}`\n"
+                                    shNoLog("dotnet nuget push -k ${env.NUGET_KEY} -s ${env.NUGET} ${nuget}")
+                                } else {
+                                    report = "${report}`Nugets built but not published (as its a ${branchType})`\n"
+                                    echo "Nugets built but not published"
+                                }
+                            }
+                        } catch(Exception e) {
+                            report = "${report} :zany_face: Failed while building Nugets\n"
+                            fNotify(report)
+                            throw e
+                        }
+                    }
+                }
+            },
+            'npm': {
+                if (shouldBuildNpm) {
+                    docker.image('node:8.10.0').inside {
+                        try {
+                            // Master build, take master repositories
+                            if (MASTER_BRANCH_BUILD == mode) {
+                                sh '''#!/bin/bash
+                        printf "//`node -p \"require('url').parse(process.env.NPM_REGISTRY_URL || 'https://registry.npmjs.org').host\"`/:_authToken=\${NPM_TOKEN}\nregistry=${NPM_REGISTRY_URL}\n" >> ~/.npmrc
+                                                            apt-get update
+                                                            apt-get install jq --yes
+                                                            echo "npm LOC `which npm; npm --version`"
+                                                            echo "JQ LOC `which jq`"
+                    '''
+                            } else {
+                                // printf "//`node -p \"require('url').parse(process.env.NPM_REGISTRY_URL_CI || 'https://registry.npmjs.org').host\"`/:_authToken=\${NPM_TOKEN_CI}\nregistry=${NPM_REGISTRY_URL_CI}\n" >> ~/.npmrc
+                                sh '''#!/bin/bash
+                        printf "//npm.ci/:_password=\"bGY=\"\n//npm.ci/:username=lf\n//npm.ci/:email=lf@sigmainfo.com\n//npm.ci/:always-auth=false\nregistry=${NPM_REGISTRY_URL_CI}\n" >> ~/.npmrc
+
+                        cat ~/.npmrc
+                        apt-get update
+                        apt-get install jq --yes
+                                                            echo "JQ LOC `which jq`"
+                    '''
+                            }
+                            // If not in feature branch
+                            if (FEATURE_BRANCH_BUILD != mode) {
+                                for(target in config.npm_targets) {
+                                    def cmd = '.version |= . + "-' + versionSuffix + '"'
+                                    // If not master, apply tag to npm version
+                                    if (MASTER_BRANCH_BUILD != mode) {
+                                        sh """#!/bin/bash
+                            cat package.json | jq '${cmd}' >  package-bk.json
+                            mv package-bk.json package.json
+                            cat package.json
+                            """
+                                    }
+
+                                    def npmPackage  = sh(script: "cat package.json | jq '.name + \"@\" + .version'", returnStdout: true).toString().replace("\n","")
+
+                                    sh target.buildScript
+                                    sh target.publishScript
+
+                                    // Build the packages
+                                    report = "${report}npm: `${npmPackage}`\n"
+                                }
+                            } else {
+                                report = "${report}`npm built but not published (as its a ${branchType})`\n"
+                                echo "Npm built but not published"
+                            }
+                        } catch(Exception e) {
+                            sh """#!/bin/bash
+                                            cat ~/.npm/_logs/*.log
+                                            """
+                            report = "${report} :zany_face: Npm failed: ${e.toString()}\n"
+                            fNotify(report)
+                            throw e
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
